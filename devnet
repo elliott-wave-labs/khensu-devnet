@@ -1,0 +1,179 @@
+#!/usr/bin/env bash
+# SPDX-License-Identifier: AGPL-3.0-only
+# Single-machine khensu.nu network: a gateway, three mixes (one per layer)
+# and a mailbox, each a `tatenan` process on a fixed UDP port.
+#
+#   ./devnet up [--host <ip>] [--fresh] [--foreground]
+#                                         build, generate keys once, start, write devnet.json
+#   ./devnet down                         stop all nodes (SIGTERM, mailbox saved)
+#   ./devnet status                       which nodes are running
+#   ./devnet logs [node]                  follow logs
+#   ./devnet demo                         two khensu-cli clients exchange messages
+set -euo pipefail
+
+root=$(cd "$(dirname "$0")" && pwd)
+tatenan_repo=${TATENAN_REPO:-$root/../khensu-tatenan}
+run=$root/run
+bin=$tatenan_repo/target/release
+nodes=(gateway-1:47000:gateway: mix-1:47001:mix:1 mix-2:47002:mix:2 mix-3:47003:mix:3 mailbox-1:47004:mailbox:)
+epochs=${DEVNET_EPOCHS:-168}
+
+build() {
+    (cd "$tatenan_repo" && cargo build --release -q -p tatenan -p khensu-cli)
+}
+
+# Runs a command in its own session so it outlives the calling shell.
+detach() {
+    if command -v setsid >/dev/null; then
+        setsid "$@"
+    else
+        perl -MPOSIX -e 'POSIX::setsid() or die "setsid"; exec @ARGV or die "exec"' "$@"
+    fi
+}
+
+pid_alive() {
+    [[ -f $1 ]] && kill -0 "$(cat "$1")" 2>/dev/null
+}
+
+up() {
+    local host=127.0.0.1 fresh=0 foreground=0
+    while [[ $# -gt 0 ]]; do
+        case $1 in
+            --host) host=$2; shift 2 ;;
+            --fresh) fresh=1; shift ;;
+            --foreground) foreground=1; shift ;;
+            *) echo "unknown option $1" >&2; exit 2 ;;
+        esac
+    done
+    if [[ -n $(ls "$run"/pids/*.pid 2>/dev/null) ]]; then
+        for p in "$run"/pids/*.pid; do
+            if pid_alive "$p"; then echo "devnet is already running; ./devnet down first" >&2; exit 1; fi
+        done
+    fi
+    build
+    mkdir -p "$run/pids" "$run/logs"
+    [[ $fresh == 1 ]] && rm -rf "$run/nodes" "$run/clients"
+    local listen=127.0.0.1
+    [[ $host != 127.0.0.1 ]] && listen=0.0.0.0
+    local entries=()
+    for spec in "${nodes[@]}"; do
+        IFS=: read -r name port role layer <<<"$spec"
+        local dir=$run/nodes/$name
+        local endpoint=$host:$port
+        if [[ ! -f $dir/node.key ]] || ! grep -q "\"endpoint\": \"$endpoint\"" "$dir/node.json" 2>/dev/null; then
+            local layer_arg=()
+            [[ -n $layer ]] && layer_arg=(--layer "$layer")
+            "$bin/tatenan" keygen --name "$name" --role "$role" "${layer_arg[@]}" --endpoint "$endpoint" \
+                --epochs "$epochs" --out "$dir" --force >/dev/null
+        fi
+        cat >"$dir/tatenan.toml" <<EOF
+listen = "$listen:$port"
+key_file = "node.key"
+directory = "../../../devnet.json"
+data_dir = "data"
+
+[log]
+format = "json"
+level = "info"
+EOF
+        entries+=("$dir/node.json")
+    done
+    "$bin/tatenan" directory --network devnet --out "$root/devnet.json" "${entries[@]}" >/dev/null
+    for spec in "${nodes[@]}"; do
+        IFS=: read -r name _ <<<"$spec"
+        rm -f "$run/pids/$name.pid"
+        detach "$bin/tatenan" run --config "$run/nodes/$name/tatenan.toml" --pid-file "$run/pids/$name.pid" \
+            </dev/null >>"$run/logs/$name.log" 2>&1 &
+    done
+    sleep 2
+    status
+    echo "directory: $root/devnet.json"
+    if [[ $foreground == 1 ]]; then
+        trap 'down; exit 0' INT TERM
+        echo "running in the foreground; Ctrl-C stops the devnet"
+        while status >/dev/null; do sleep 2; done
+        if [[ -z $(ls "$run"/pids/*.pid 2>/dev/null) ]]; then
+            echo "devnet stopped"
+            exit 0
+        fi
+        echo "a node exited; see ./devnet logs" >&2
+        down
+        exit 1
+    fi
+}
+
+down() {
+    shopt -s nullglob
+    local pids=()
+    for p in "$run"/pids/*.pid; do
+        if pid_alive "$p"; then
+            kill -TERM "$(cat "$p")"
+            pids+=("$(cat "$p")")
+        fi
+    done
+    for _ in $(seq 50); do
+        local alive=0
+        for pid in "${pids[@]}"; do kill -0 "$pid" 2>/dev/null && alive=1; done
+        [[ $alive == 0 ]] && break
+        sleep 0.1
+    done
+    for pid in "${pids[@]}"; do kill -KILL "$pid" 2>/dev/null || true; done
+    rm -f "$run"/pids/*.pid
+    echo "devnet stopped"
+}
+
+status() {
+    local down=0
+    for spec in "${nodes[@]}"; do
+        IFS=: read -r name port _ <<<"$spec"
+        if pid_alive "$run/pids/$name.pid"; then
+            printf '%-10s up    udp/%s  pid %s\n' "$name" "$port" "$(cat "$run/pids/$name.pid")"
+        else
+            printf '%-10s down  udp/%s\n' "$name" "$port"
+            down=1
+        fi
+    done
+    return $down
+}
+
+logs() {
+    if [[ $# -gt 0 ]]; then tail -f "$run/logs/$1.log"; else tail -f "$run"/logs/*.log; fi
+}
+
+demo() {
+    status >/dev/null || { echo "devnet is not running; ./devnet up first" >&2; exit 1; }
+    local c=$run/clients cli=$bin/khensu-cli
+    rm -rf "$c" && mkdir -p "$c"
+    export KHENSU_DIRECTORY=$root/devnet.json
+    "$cli" -s "$c/alice.state" init --name alice
+    "$cli" -s "$c/bob.state" init --name bob
+    "$cli" -s "$c/bob.state" card --out "$c/bob.card"
+    local conv
+    conv=$("$cli" -s "$c/alice.state" chat "$c/bob.card")
+    "$cli" -s "$c/alice.state" send "$conv" "hello bob" >/dev/null
+    echo "alice -> bob in conversation $conv"
+    "$cli" -s "$c/bob.state" run --messages 1 --secs 120 </dev/null | tee "$c/bob.out" &
+    local bob=$!
+    "$cli" -s "$c/alice.state" run --until-sent --secs 120 </dev/null >/dev/null
+    wait $bob
+    grep -q "hello bob" "$c/bob.out" || { echo "bob did not get the message" >&2; exit 1; }
+    "$cli" -s "$c/bob.state" send "$conv" "hi alice" >/dev/null
+    echo "bob -> alice"
+    "$cli" -s "$c/alice.state" run --messages 1 --secs 120 </dev/null | tee "$c/alice.out" &
+    local alice=$!
+    "$cli" -s "$c/bob.state" run --until-sent --secs 120 </dev/null >/dev/null
+    wait $alice
+    grep -q "hi alice" "$c/alice.out" || { echo "alice did not get the reply" >&2; exit 1; }
+    echo "demo ok"
+}
+
+cmd=${1:-}
+shift || true
+case $cmd in
+    up) up "$@" ;;
+    down) down ;;
+    status) status ;;
+    logs) logs "$@" ;;
+    demo) demo ;;
+    *) sed -n '3,11p' "$0" | sed 's/^# \{0,1\}//'; exit 2 ;;
+esac
