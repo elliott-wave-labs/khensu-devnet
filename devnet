@@ -92,10 +92,13 @@ EOF
         trap 'down; exit 0' INT TERM
         echo "running in the foreground; Ctrl-C stops the devnet"
         while status >/dev/null; do sleep 2; done
-        if [[ -z $(ls "$run"/pids/*.pid 2>/dev/null) ]]; then
-            echo "devnet stopped"
-            exit 0
-        fi
+        for _ in $(seq 60); do
+            if [[ -z $(ls "$run"/pids/*.pid 2>/dev/null) ]]; then
+                echo "devnet stopped"
+                exit 0
+            fi
+            sleep 0.1
+        done
         echo "a node exited; see ./devnet logs" >&2
         down
         exit 1
@@ -106,9 +109,10 @@ down() {
     shopt -s nullglob
     local pids=()
     for p in "$run"/pids/*.pid; do
-        if pid_alive "$p"; then
-            kill -TERM "$(cat "$p")"
-            pids+=("$(cat "$p")")
+        local pid
+        pid=$(cat "$p" 2>/dev/null) || continue
+        if kill -TERM "$pid" 2>/dev/null; then
+            pids+=("$pid")
         fi
     done
     for _ in $(seq 50); do
