@@ -1,22 +1,29 @@
 #!/usr/bin/env bash
 # SPDX-License-Identifier: AGPL-3.0-only
-# Single-machine khensu.nu network: a gateway, three mixes (one per layer)
-# and a mailbox, each a `tatenan` process on a fixed UDP port.
+# Single-machine khensu.nu network: a gateway, three mixes and two mailboxes,
+# each a `tatenan` process on a fixed UDP port, every node on the committee
+# that agrees the hourly epoch header.
 #
 #   ./devnet up [--host <ip>] [--fresh] [--foreground]
-#                                         build, generate keys once, start, write devnet.json
-#   ./devnet down                         stop all nodes (SIGTERM, mailbox saved)
-#   ./devnet status                       which nodes are running
+#                                         build, generate keys and leases once, sign the genesis
+#                                         header with the devnet founder key, start, write devnet.json
+#   ./devnet down                         stop all nodes (SIGTERM, mailboxes saved)
+#   ./devnet status                       which nodes are running, and what each says over ~node status
+#   ./devnet node <name> <~node command>  ask one node (status, peers, receipts, measurements, header, lease, log <filter>, drain)
 #   ./devnet logs [node]                  follow logs
 #   ./devnet demo                         two khensu-cli clients exchange messages
+#   ./devnet test [secs]                  loops through the mixes from a client, header check, node loops and links
 set -euo pipefail
 
 root=$(cd "$(dirname "$0")" && pwd)
 tatenan_repo=${TATENAN_REPO:-$root/../khensu-tatenan}
 run=$root/run
 bin=$tatenan_repo/target/release
-nodes=(gateway-1:47000:gateway: mix-1:47001:mix:1 mix-2:47002:mix:2 mix-3:47003:mix:3 mailbox-1:47004:mailbox:)
-epochs=${DEVNET_EPOCHS:-168}
+# name:port:roles (comma separated; committee is added to every node)
+nodes=(gateway-1:47000:gateway,mix mix-1:47001:mix mix-2:47002:mix mix-3:47003:mix mailbox-1:47004:mailbox,mix mailbox-2:47005:mailbox,mix)
+# Epochs the first lease covers; the nodes renew their leases themselves.
+lease_epochs=${DEVNET_LEASE_EPOCHS:-24}
+spare_epochs=${DEVNET_SPARE_EPOCHS:-168}
 
 build() {
     (cd "$tatenan_repo" && cargo build --release -q -p tatenan -p khensu-cli)
@@ -33,6 +40,11 @@ detach() {
 
 pid_alive() {
     [[ -f $1 ]] && kill -0 "$(cat "$1")" 2>/dev/null
+}
+
+node_names() {
+    local spec
+    for spec in "${nodes[@]}"; do echo "${spec%%:*}"; done
 }
 
 up() {
@@ -52,19 +64,27 @@ up() {
     fi
     build
     mkdir -p "$run/pids" "$run/logs"
-    [[ $fresh == 1 ]] && rm -rf "$run/nodes" "$run/clients"
+    [[ $fresh == 1 ]] && rm -rf "$run/nodes" "$run/clients" "$run/founder"
     local listen=127.0.0.1
     [[ $host != 127.0.0.1 ]] && listen=0.0.0.0
-    local entries=()
+    if [[ ! -f $run/founder/founder.key ]]; then
+        mkdir -p "$run/founder"
+        "$bin/tatenan" founder-keygen --out "$run/founder" >"$run/founder/founder.pub"
+    fi
+    local leases=() regenerated=0
     for spec in "${nodes[@]}"; do
-        IFS=: read -r name port role layer <<<"$spec"
+        IFS=: read -r name port roles <<<"$spec"
         local dir=$run/nodes/$name
         local endpoint=$host:$port
-        if [[ ! -f $dir/node.key ]] || ! grep -q "\"endpoint\": \"$endpoint\"" "$dir/node.json" 2>/dev/null; then
-            local layer_arg=()
-            [[ -n $layer ]] && layer_arg=(--layer "$layer")
-            "$bin/tatenan" keygen --name "$name" --role "$role" "${layer_arg[@]}" --endpoint "$endpoint" \
-                --epochs "$epochs" --out "$dir" --force >/dev/null
+        if [[ ! -f $dir/node.key ]] || [[ ! -f $dir/node.lease ]] || ! grep -qx "$endpoint" "$dir/endpoint" 2>/dev/null; then
+            local role_args=()
+            local r
+            for r in ${roles//,/ } committee; do role_args+=(--role "$r"); done
+            rm -rf "$dir/data"
+            "$bin/tatenan" keygen --name "$name" "${role_args[@]}" --endpoint "$endpoint" \
+                --epochs "$lease_epochs" --spare-epochs "$spare_epochs" --out "$dir" --force >/dev/null
+            echo "$endpoint" >"$dir/endpoint"
+            regenerated=1
         fi
         cat >"$dir/tatenan.toml" <<EOF
 listen = "$listen:$port"
@@ -75,12 +95,20 @@ data_dir = "data"
 [log]
 format = "json"
 level = "info"
+file = "data/log/tatenan.log"
+
+[lease]
+mode = "always_on"
+hours = $lease_epochs
 EOF
-        entries+=("$dir/node.json")
+        leases+=("$dir/node.lease")
     done
-    "$bin/tatenan" directory --network devnet --out "$root/devnet.json" "${entries[@]}" >/dev/null
-    for spec in "${nodes[@]}"; do
-        IFS=: read -r name _ <<<"$spec"
+    if [[ $regenerated == 1 ]] || [[ ! -f $root/devnet.json ]]; then
+        # Fresh leases need a fresh genesis; the nodes resume from their own saved headers otherwise.
+        for name in $(node_names); do rm -rf "$run/nodes/$name/data/directory.json" "$run/nodes/$name/data/directory.next.json"; done
+        "$bin/tatenan" directory --network devnet --founder-key "$run/founder/founder.key" --out "$root/devnet.json" "${leases[@]}"
+    fi
+    for name in $(node_names); do
         rm -f "$run/pids/$name.pid"
         detach "$bin/tatenan" run --config "$run/nodes/$name/tatenan.toml" --pid-file "$run/pids/$name.pid" \
             </dev/null >>"$run/logs/$name.log" 2>&1 &
@@ -91,7 +119,7 @@ EOF
     if [[ $foreground == 1 ]]; then
         trap 'down; exit 0' INT TERM
         echo "running in the foreground; Ctrl-C stops the devnet"
-        while status >/dev/null; do sleep 2; done
+        while processes >/dev/null; do sleep 2; done
         for _ in $(seq 60); do
             if [[ -z $(ls "$run"/pids/*.pid 2>/dev/null) ]]; then
                 echo "devnet stopped"
@@ -126,12 +154,13 @@ down() {
     echo "devnet stopped"
 }
 
-status() {
+# Which processes are alive; returns 1 if any is down.
+processes() {
     local down=0
     for spec in "${nodes[@]}"; do
-        IFS=: read -r name port _ <<<"$spec"
+        IFS=: read -r name port roles <<<"$spec"
         if pid_alive "$run/pids/$name.pid"; then
-            printf '%-10s up    udp/%s  pid %s\n' "$name" "$port" "$(cat "$run/pids/$name.pid")"
+            printf '%-10s up    udp/%s  pid %-6s %s\n' "$name" "$port" "$(cat "$run/pids/$name.pid")" "$roles,committee"
         else
             printf '%-10s down  udp/%s\n' "$name" "$port"
             down=1
@@ -140,12 +169,42 @@ status() {
     return $down
 }
 
+# One `~node` command to one node over its control socket.
+node() {
+    local name=${1:-}
+    shift || true
+    [[ -z $name ]] && { echo "usage: ./devnet node <name> <~node command>" >&2; exit 2; }
+    "$bin/tatenan" shell --socket "$run/nodes/$name/data/control.sock" "$@"
+}
+
+status() {
+    local rc=0
+    processes || rc=1
+    echo
+    local name
+    for name in $(node_names); do
+        if pid_alive "$run/pids/$name.pid"; then
+            "$bin/tatenan" shell --socket "$run/nodes/$name/data/control.sock" --json status 2>/dev/null \
+                | python3 -c '
+import json, sys
+s = json.load(sys.stdin)
+nxt = " next %s" % s["next_header_epoch"] if s.get("next_header_epoch") else ""
+mailbox = "  mailbox %s items" % s["mailbox"]["items"] if s.get("mailbox") else ""
+print("%-10s epoch %s header %s%s  links %s out %s in  packets %s  loops %s/%s  receipts %s issued %s received%s" % (
+    s["name"], s["epoch"], s["header_epoch"], nxt, s["links_out"], s["peers_in"], s["packets"],
+    s["loops"]["returned"], s["loops"]["sent"], s["receipts"]["issued"], s["receipts"]["received"], mailbox))' \
+                || echo "$name: not answering on its control socket yet"
+        fi
+    done
+    return $rc
+}
+
 logs() {
     if [[ $# -gt 0 ]]; then tail -f "$run/logs/$1.log"; else tail -f "$run"/logs/*.log; fi
 }
 
 demo() {
-    status >/dev/null || { echo "devnet is not running; ./devnet up first" >&2; exit 1; }
+    processes >/dev/null || { echo "devnet is not running; ./devnet up first" >&2; exit 1; }
     local c=$run/clients cli=$bin/khensu-cli
     rm -rf "$c" && mkdir -p "$c"
     export KHENSU_DIRECTORY=$root/devnet.json
@@ -171,13 +230,42 @@ demo() {
     echo "demo ok"
 }
 
+# Loops from a client, then every node's own loops, links and header.
+test_network() {
+    local secs=${1:-30}
+    processes >/dev/null || { echo "devnet is not running; ./devnet up first" >&2; exit 1; }
+    export KHENSU_DIRECTORY=$root/devnet.json
+    echo "client loops for ${secs}s"
+    "$bin/khensu-cli" net-test --secs "$secs" --loops 100
+    local failed=0 name
+    for name in $(node_names); do
+        local s
+        s=$("$bin/tatenan" shell --socket "$run/nodes/$name/data/control.sock" --json status) || { echo "$name: no answer"; failed=1; continue; }
+        python3 - "$name" "$s" <<'EOF' || failed=1
+import json, sys
+name, s = sys.argv[1], json.loads(sys.argv[2])
+problems = []
+if s["loops"]["sent"] == 0 or s["loops"]["returned"] == 0: problems.append("no node loops came back")
+if s["links_out"] == 0 or s["peers_in"] == 0: problems.append("no authenticated links")
+if s["header_epoch"] != s["epoch"]: problems.append(f"header epoch {s['header_epoch']} but clock says {s['epoch']}")
+if s["undecryptable"] > s["packets"] // 100: problems.append(f"{s['undecryptable']} undecryptable of {s['packets']}")
+print(f"{name:<10} loops {s['loops']['returned']}/{s['loops']['sent']} rtt {s['loops']['last_rtt_ms']} ms, links {s['links_out']} out {s['peers_in']} in, header {s['header_epoch']}, committee {'yes' if s['committee'] else 'no'}"
+      + ("" if not problems else "  PROBLEM: " + "; ".join(problems)))
+sys.exit(1 if problems else 0)
+EOF
+    done
+    [[ $failed == 0 ]] && echo "network test ok" || { echo "network test found problems" >&2; exit 1; }
+}
+
 cmd=${1:-}
 shift || true
 case $cmd in
     up) up "$@" ;;
     down) down ;;
     status) status ;;
+    node) node "$@" ;;
     logs) logs "$@" ;;
     demo) demo ;;
-    *) sed -n '3,11p' "$0" | sed 's/^# \{0,1\}//'; exit 2 ;;
+    test) test_network "$@" ;;
+    *) sed -n '3,15p' "$0" | sed 's/^# \{0,1\}//'; exit 2 ;;
 esac
