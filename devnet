@@ -26,6 +26,8 @@ lease_epochs=${DEVNET_LEASE_EPOCHS:-24}
 spare_epochs=${DEVNET_SPARE_EPOCHS:-168}
 
 build() {
+    # DEVNET_PREBUILT=1: use the binaries already in $bin (a host without Rust).
+    [[ -n ${DEVNET_PREBUILT:-} ]] && return
     (cd "$tatenan_repo" && cargo build --release -q -p tatenan -p khensu-cli)
 }
 
